@@ -1,0 +1,18 @@
+{
+  "name": "opencode-sensevoice-voice",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode V2 TUI voice input plugin backed by a local SenseVoiceSmall (FunASR) server.",
+  "license": "GPL-3.0-or-later",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.tsx"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.0",
+    "@opentui/core": ">=0.5.8",
+    "@opentui/solid": ">=0.5.8",
+    "solid-js": ">=1.9.0"
+  }
+}
