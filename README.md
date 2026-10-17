@@ -154,6 +154,13 @@ ln -s /home/arch-xnn/项目/opencodevoice ~/.config/opencode/plugins/sensevoice
 - 没有设备：`pactl list short sources` 查看输入源；WSL2 需 WSLg。
 - 插件未生效：检查 `~/.config/opencode/cli.json` 的 `plugins` 数组，并重启 TUI；
   日志在 `~/.local/share/opencode/log/opencode.log`。
+- 按钮重复出现两个 / 一闪一闪：CLI 会在**同一个进程里把插件加载多次**（本机实测 3 次），
+  而且改动插件文件会触发热重载，于是有多个实例同时往同一行画按钮。现在只有最后 `setup`
+  的实例持有按钮：新实例先停掉上一个实例并摘掉它的按钮，行内已存在的按钮按 id 复用，
+  稳定状态下也不再多写一次文字。重启 TUI 生效。
+- 热键突然全部失灵：早期版本在 `setup` 里抛异常会让整个插件（含快捷键）失效 —— 现在
+  `setup` 不会抛异常，按钮挂载失败会自动退回槽位挂载，快捷键不受影响。
+- 按钮偶尔消失：宿主重建输入框（切换会话、热重载）后插件会在 1 秒内自动重新挂载。
 - 想重新安装服务环境：删除 `.venv` 再运行脚本。
 
 ## 许可

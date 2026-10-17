@@ -11,7 +11,9 @@
  * into it. No dialog, no auto-send.
  */
 import { Plugin } from "@opencode/plugin/tui"
-import { BoxRenderable, TextRenderable } from "@opentui/core"
+// Namespace import on purpose: the host resolves this peer for us, and a missing
+// binding must never take the whole plugin (keybinds included) down at setup.
+import * as opentui from "@opentui/core"
 import { createSignal } from "solid-js"
 import { spawn, type ChildProcess } from "node:child_process"
 import { readFile, rm } from "node:fs/promises"
@@ -52,6 +54,7 @@ interface Options {
 interface EditorLike {
   insertText(text: string): void
   plainText?: string
+  isDestroyed?: boolean
 }
 
 // ffmpeg finalises the WAV reliably on SIGINT; `parecord --file-format=wav`
@@ -105,20 +108,29 @@ export default Plugin.define({
     /** Every status change repaints the button; it is not a Solid-owned node. */
     const setStatus = (next: Status) => {
       setStatusRaw(next)
-      refreshButton()
+      paintButton()
     }
 
     let child: ChildProcess | undefined
     let childFile: string | undefined
     /** The prompt editor captured when recording started. */
     let target: EditorLike | null = null
+    /** Transcript kept when no editor was reachable, retried by the tick. */
+    let pendingText: string | undefined
+    let pendingSubmit = false
+    let pendingTries = 0
+
+    /** A renderable the host already tore down must never be touched again. */
+    const live = (node: unknown): boolean =>
+      !!node && (node as { isDestroyed?: boolean }).isDestroyed !== true
 
     const toast = (message: string, variant: Variant = "info") =>
       context.ui.toast.show({ message, variant })
 
     function focusedEditor(): EditorLike | null {
       try {
-        return context.renderer.currentFocusedEditor ?? null
+        const editor = context.renderer.currentFocusedEditor as unknown as EditorLike | null
+        return live(editor) ? editor : null
       } catch {
         return null
       }
@@ -206,7 +218,7 @@ export default Plugin.define({
       return (data.text ?? "").trim()
     }
 
-    function insert(text: string): boolean {
+    function insert(text: string, quiet = false): boolean {
       const write = (editor: EditorLike) => {
         const existing = editor.plainText ?? ""
         const prefix =
@@ -214,13 +226,16 @@ export default Plugin.define({
         editor.insertText(prefix + text)
       }
 
+      // The captured editor can be gone by now (session switch destroys it), so
+      // re-resolve the focused one and skip anything the host already tore down.
       const editors: EditorLike[] = []
-      if (target) editors.push(target)
-      const current = focusedEditor()
-      if (current && current !== target) editors.push(current)
+      for (const candidate of [target, focusedEditor()]) {
+        if (!candidate || !live(candidate) || editors.includes(candidate)) continue
+        editors.push(candidate)
+      }
 
       if (editors.length === 0) {
-        toast("没找到输入栏，请把光标放进输入框再试一次", "warning")
+        if (!quiet) toast("没找到输入栏，请把光标放进输入框再试一次", "warning")
         return false
       }
 
@@ -231,13 +246,24 @@ export default Plugin.define({
           return true
         } catch (error) {
           lastError = error
+          if (!live(editor) && editor === target) target = null
         }
       }
-      toast(
-        `写入输入栏失败: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
-        "error",
-      )
+      if (!quiet) {
+        toast(
+          `写入输入栏失败: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+          "error",
+        )
+      }
       return false
+    }
+
+    function submitPrompt(): void {
+      try {
+        context.keymap.dispatch("prompt.submit")
+      } catch (error) {
+        toast(`提交失败: ${error instanceof Error ? error.message : String(error)}`, "error")
+      }
     }
 
     async function finish(autoSubmit: boolean): Promise<void> {
@@ -254,15 +280,16 @@ export default Plugin.define({
           return
         }
 
-        if (!insert(text)) return
-
-        if (autoSubmit) {
-          try {
-            context.keymap.dispatch("prompt.submit")
-          } catch (error) {
-            toast(`提交失败: ${error instanceof Error ? error.message : String(error)}`, "error")
-          }
+        if (!insert(text, true)) {
+          // Focus sat outside the composer (session list, dialog, ...). Keep the
+          // transcript and retry from the tick instead of dropping it.
+          pendingText = text
+          pendingSubmit = autoSubmit
+          pendingTries = 0
+          return
         }
+
+        if (autoSubmit) submitPrompt()
       } catch (error) {
         toast(
           `转写失败: ${error instanceof Error ? error.message : String(error)}（请确认 SenseVoice 服务已启动: ${options.endpoint}）`,
@@ -313,15 +340,37 @@ export default Plugin.define({
     // The V2 slot tree has no path for the composer row that renders
     // "Build · model": that row is host-owned, not a slot boundary (only
     // `prompt.footer*`, the line under the box, is exposed). It is reachable
-    // through the renderer though — the focused editor's parent holds the
-    // textarea and the status row as siblings, and the status row lays out
-    // with `justifyContent: space-between`, so a second child lands on its
-    // right edge. That is exactly the bottom-right corner of the input box,
-    // and it uses no extra line.
-    let mountedRow: any
-    let button: BoxRenderable | undefined
-    let buttonText: TextRenderable | undefined
-    let mountTimer: ReturnType<typeof setInterval> | undefined
+    // through the renderer though — the editor's parent holds the textarea and
+    // the status row as siblings, and the status row lays out with
+    // `justifyContent: space-between`, so a second child lands on its right
+    // edge: the bottom-right corner of the input box, using no extra line.
+    //
+    // Two rules keep that safe, because the host owns the subtree and destroys
+    // it on every session switch:
+    //   1. never touch a renderable whose `isDestroyed` is set — writing to the
+    //      text buffer of a torn-down node threw "TextBuffer is destroyed" once
+    //      per second, and
+    //   2. rebuild the button from scratch when it was destroyed with the old
+    //      subtree, instead of re-adding the dead node.
+    let mountedRow: unknown
+    let button: any
+    let buttonText: any
+    let painted: string | undefined
+    let ticker: ReturnType<typeof setInterval> | undefined
+
+    const BUTTON_ID = "sensevoice.voice.button"
+    const LABEL_ID = "sensevoice.voice.label"
+    // Marker props next to the ids: the ids are also readable, but a plain flag
+    // on the node keeps detection working whatever the host does with `id`.
+    const BUTTON_MARK = "__sensevoiceVoiceButton"
+    const LABEL_MARK = "__sensevoiceVoiceLabel"
+    const isOurButton = (node: any) => !!node && (node[BUTTON_MARK] === true || node.id === BUTTON_ID)
+    const isOurLabel = (node: any) => !!node && (node[LABEL_MARK] === true || node.id === LABEL_ID)
+    const BoxCtor = () => (opentui as any)?.BoxRenderable as any
+    const TextCtor = () => (opentui as any)?.TextRenderable as any
+    // Resolved once: a host that stops exposing these classes degrades to the
+    // slot button, because a setup throw would take the keybinds down with it.
+    const canMount = typeof BoxCtor() === "function" && typeof TextCtor() === "function"
 
     const buttonLabel = () =>
       status() === "recording" ? "● 录音中" : status() === "working" ? "● 转写中" : "○ 录音"
@@ -333,59 +382,185 @@ export default Plugin.define({
           ? context.theme.text.base
           : context.theme.text.muted
 
-    function refreshButton() {
-      if (!buttonText) return
-      buttonText.content = ` ${buttonLabel()} `
-      buttonText.fg = buttonColor()
+    function detachButton(): void {
+      const dead = button
+      const parent: any = (dead as any)?.parent
+      button = undefined
+      buttonText = undefined
+      mountedRow = undefined
+      painted = undefined
+      if (!dead) return
+      // `destroy()` marks the node dead but leaves it in the parent's child list,
+      // so detach explicitly — otherwise the stale node keeps painting and the
+      // next mount looks like a duplicate.
+      try {
+        parent?.remove?.(dead)
+      } catch {}
+      try {
+        if (live(dead)) dead.destroy()
+      } catch {}
+    }
+
+    function paintButton(force = false): void {
+      if (!button) return
+      const text = ` ${buttonLabel()} `
+      if (!force && painted === text) return
+      try {
+        if (!live(buttonText)) {
+          detachButton()
+          return
+        }
+        buttonText.content = text
+        buttonText.fg = buttonColor()
+        painted = text
+      } catch {
+        detachButton() // the host tore the subtree down mid-flight
+      }
+    }
+
+    /** Editors in the tree, focused one first. Focus is the cheap path; the walk
+     *  covers focus living outside the composer (session list, dialog, ...). */
+    function editorCandidates(): EditorLike[] {
+      const found: EditorLike[] = []
+      const focused = focusedEditor()
+      if (focused) found.push(focused)
+      let visited = 0
+      const walk = (node: any, depth: number): void => {
+        if (!node?.getChildren || depth > 24 || visited > 4000) return
+        for (const child of node.getChildren()) {
+          if (++visited > 4000) return
+          if (!live(child)) continue
+          if (typeof child.insertText === "function" && "plainText" in child) found.push(child)
+          else walk(child, depth + 1)
+        }
+      }
+      try {
+        walk((context.renderer as any).root, 0)
+      } catch {}
+      return found
     }
 
     /** The host row that renders "Build · model" inside the input box. */
-    function composerStatusRow(): any | undefined {
-      try {
-        const editor = context.renderer.currentFocusedEditor as any
-        const parent = editor?.parent
-        if (!parent?.getChildren) return undefined
+    function composerStatusRow(): unknown {
+      for (const editor of editorCandidates().reverse()) {
+        const parent: any = (editor as any).parent
+        if (!parent?.getChildren) continue
         const siblings: any[] = parent.getChildren().filter((child: any) => child !== editor)
         for (let index = siblings.length - 1; index >= 0; index--) {
           if ((siblings[index]?.getChildrenCount?.() ?? 0) > 0) return siblings[index]
         }
-      } catch {}
+      }
       return undefined
     }
 
-    function mountButton() {
-      if (options.button !== "composer") return
-      if (button && button.parent && mountedRow && !mountedRow.isDestroyed) return
-      const row = composerStatusRow()
-      if (!row) return
-      if (!button) {
-        const renderer = context.renderer as any
-        button = new BoxRenderable(renderer, { id: "sensevoice.voice.button", flexShrink: 0 })
-        buttonText = new TextRenderable(renderer, {
-          id: "sensevoice.voice.label",
-          content: " ○ 录音 ",
-        })
-        button.add(buttonText)
-        button.onMouseDown = (event) => {
-          event.stopPropagation()
-          toggle()
+    function mountButton(): void {
+      if (options.button !== "composer" || !canMount) return
+      try {
+        if ((button && !live(button)) || (buttonText && !live(buttonText))) detachButton()
+        if (mountedRow && !live(mountedRow)) mountedRow = undefined
+
+        const row: any = mountedRow ?? composerStatusRow()
+        if (!live(row) || typeof row.getChildren !== "function") return
+
+        const kids: any[] = row.getChildren()
+        // Steady state: our node is attached and alive. Repaint only when the
+        // label actually changed — forcing a write every tick made it blink.
+        if (button && live(button) && kids.includes(button)) {
+          paintButton()
+          return
         }
+
+        // (Re)attach. Adopt whatever button this row already has, so a host
+        // rebuild or a second plugin instance can never stack another one.
+        const existing = kids.find(isOurButton)
+        if (existing && live(existing)) {
+          detachButton() // drops our own node, keeps the one already in the row
+          button = existing
+          const children: any[] = existing.getChildren?.() ?? []
+          buttonText = children.find(isOurLabel) ?? children[0]
+        } else {
+          for (const kid of kids) {
+            if (!isOurButton(kid)) continue
+            try {
+              row.remove(kid)
+              kid.destroy()
+            } catch {}
+          }
+        }
+
+        if (!button) {
+          const Box = BoxCtor()
+          const Text = TextCtor()
+          if (typeof Box !== "function" || typeof Text !== "function") return
+          button = new Box(context.renderer as any, { id: BUTTON_ID, flexShrink: 0 })
+          button[BUTTON_MARK] = true
+          buttonText = new Text(context.renderer as any, {
+            id: LABEL_ID,
+            content: ` ${buttonLabel()} `,
+          })
+          buttonText[LABEL_MARK] = true
+          button.add(buttonText)
+          button.onMouseDown = (event: any) => {
+            event?.stopPropagation?.()
+            toggle()
+          }
+        }
+
+        mountedRow = row
+        if (!(row.getChildren() as unknown[]).includes(button)) row.add(button)
+        painted = undefined
+        paintButton(true)
+      } catch {
+        detachButton() // rebuild from scratch on the next tick
       }
-      row.add(button)
-      mountedRow = row
-      refreshButton()
     }
 
-    if (options.button === "composer") {
-      mountButton()
-      // Solid owns the composer subtree, so re-check: a re-render or a session
-      // switch can drop a child the host did not create.
-      mountTimer = setInterval(mountButton, 1000)
+    /** A transcript with nowhere to land yet is retried, not thrown away. */
+    function retryPending(): void {
+      if (pendingText === undefined) return
+      if (pendingTries++ >= 30) {
+        pendingText = undefined
+        pendingSubmit = false
+        toast("一直没找到输入栏，转写文本已丢弃（把光标放进输入框再按 alt+r）", "warning")
+        return
+      }
+      if (!insert(pendingText, true)) return
+      const submit = pendingSubmit
+      pendingText = undefined
+      pendingSubmit = false
+      if (submit) submitPrompt()
     }
 
-    const slotPath = options.button && options.button !== "composer" ? options.button : undefined
-    const removeButton = slotPath
-      ? context.ui.slot({
+    function tick(): void {
+      try {
+        mountButton()
+        retryPending()
+      } catch {}
+    }
+
+    const slotPath =
+      options.button && options.button !== "composer"
+        ? options.button
+        : options.button === "composer" && !canMount
+          ? ("prompt.footer" as const)
+          : undefined
+    // Exactly one plugin instance may own the button. The CLI hot-reloads
+    // plugins (every edit spins up a new instance), and two owners ping-pong:
+    // each tick one adopts the row's button and deletes the other's node, which
+    // shows up as a duplicated, flickering button. So a new instance shuts the
+    // previous one down first; the handoff handle lives on globalThis, which
+    // survives the module being re-evaluated.
+    const handoff = globalThis as unknown as { __sensevoiceVoiceStop?: () => void }
+    try {
+      handoff.__sensevoiceVoiceStop?.()
+    } catch {}
+
+    let removeButton: (() => void) | undefined
+    if (slotPath) {
+      // A setup throw takes the keybinds down with it, so button placement is
+      // always best-effort.
+      try {
+        removeButton = context.ui.slot({
           append: slotPath,
           render: () => (
             <box onMouseDown={() => toggle()}>
@@ -393,14 +568,31 @@ export default Plugin.define({
             </box>
           ),
         })
-      : undefined
+      } catch {}
+    }
+
+    // Both jobs on one timer: re-mount the button after the host rebuilds the
+    // composer, and flush a transcript that had nowhere to land. Everything
+    // inside is exception-guarded, so it can never spam the log.
+    function stop(): void {
+      if (ticker) clearInterval(ticker)
+      ticker = undefined
+      try {
+        removeButton?.()
+      } catch {}
+      removeButton = undefined
+      detachButton()
+    }
+    handoff.__sensevoiceVoiceStop = stop
+
+    tick()
+    try {
+      ticker = setInterval(tick, 1000)
+    } catch {}
 
     return () => {
-      if (mountTimer) clearInterval(mountTimer)
-      removeButton?.()
-      try {
-        button?.destroy()
-      } catch {}
+      if (handoff.__sensevoiceVoiceStop === stop) handoff.__sensevoiceVoiceStop = undefined
+      stop()
       if (child) {
         try {
           child.kill("SIGINT")
