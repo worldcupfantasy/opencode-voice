@@ -33,6 +33,7 @@ opencodevoice/
 ├── index.ts                # 服务端入口（空实现，仅为让包/发现两种加载方式都能工作）
 ├── tui.tsx                 # V2 TUI 插件本体：快捷键 + 输入框内语音按钮、录音、转写、写入
 ├── scripts/serve-sensevoice.sh   # 用 uv 启动本地 SenseVoiceSmall 服务
+├── scripts/install-service.sh    # 把上面这个服务装成 systemd user 服务（登录自启）
 └── README.md
 ```
 
@@ -57,6 +58,31 @@ cd /home/arch-xnn/项目/opencodevoice
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/v1/models
 ```
+
+### 让它开机/登录自启（推荐）
+
+上面的脚本是**前台运行**的，关掉终端服务就没了 —— 插件本身不会帮你拉起服务，
+连接不上就会报 `转写失败: ECONNREFUSED`。用一条命令装成 systemd user 服务即可：
+
+```sh
+./scripts/install-service.sh          # 写入 ~/.config/systemd/user/sensevoice.service
+                                      # → daemon-reload → enable --now → 等 /health 通过
+```
+
+装好之后：
+
+```sh
+systemctl --user status sensevoice         # 看状态
+journalctl --user -u sensevoice -f         # 看日志
+systemctl --user restart sensevoice        # 重启（改完配置/换设备后）
+systemctl --user disable --now sensevoice  # 临时关掉
+./scripts/install-service.sh --uninstall   # 彻底卸载
+```
+
+- 登录后自动启动，崩溃自动重启（`Restart=on-failure`）。
+- 想开机即启（不等图形登录）可 `loginctl enable-linger "$USER"`，代价是常驻内存。
+- 换 GPU：`FUNASR_DEVICE=cuda ./scripts/install-service.sh`，然后 `systemctl --user restart sensevoice`。
+- 脚本会把**当前目录的绝对路径**写进 unit，所以别移动这个仓库；移动后重跑一次即可。
 
 ## 二、启用插件
 
@@ -146,8 +172,10 @@ ln -s /home/arch-xnn/项目/opencodevoice ~/.config/opencode/plugins/sensevoice
 
 ## 故障排查
 
-- 提示 `转写失败: HTTP ...` 或连接被拒：确认服务已启动（`curl http://127.0.0.1:8000/health`），
-  且端口与 `endpoint` 一致。
+- 提示 `转写失败: ECONNREFUSED: Unable to connect`：服务没在跑。插件不会自动拉起服务，
+  先 `systemctl --user start sensevoice`（首次用 `./scripts/install-service.sh` 装好），
+  或临时 `./scripts/serve-sensevoice.sh`；然后 `curl http://127.0.0.1:8000/health` 确认。
+- 提示 `转写失败: HTTP ...`：确认端口与 `endpoint` 一致。
 - 提示 `无法启动录音程序`：确认 `ffmpeg` 在 PATH 中，或改用 `arecord`。
 - 提示 `没找到输入栏`：热键触发时输入框没有获得焦点（比如焦点在列表/弹窗上），
   点一下输入框再按热键即可。
