@@ -14,6 +14,9 @@ OpenAI 兼容 `/v1/audio/transcriptions` 服务），全程离线，音频不出
       → 转写文本 → 直接写入输入框（不弹窗、不自动发送）
 ```
 
+服务没在跑也不会失败：转写遇到连接被拒时，插件会自己把本地服务拉起来并重试这一次转写
+（`autostart`，默认开；详见「一、启动本地 SenseVoice 服务」）。
+
 V2 的 CLI 插件 API 本身没有“写入输入框”的接口，但渲染器有：
 `context.renderer.currentFocusedEditor` 就是当前获得焦点的编辑缓冲（即输入框），
 对它调用 `EditBufferRenderable.insertText(text)` 即可把转写结果直接打进输入框，
@@ -61,13 +64,15 @@ curl http://127.0.0.1:8000/v1/models
 
 ### 让它开机/登录自启（推荐）
 
-上面的脚本是**前台运行**的，关掉终端服务就没了 —— 插件本身不会帮你拉起服务，
-连接不上就会报 `转写失败: ECONNREFUSED`。用一条命令装成 systemd user 服务即可：
+上面的脚本是**前台运行**的，关掉终端服务就没了。想让它一直待命，用一条命令装成
+systemd user 服务（登录即起、崩溃自动重启，opencode 启动前服务就已就绪，不用等）：
 
 ```sh
 ./scripts/install-service.sh          # 写入 ~/.config/systemd/user/sensevoice.service
                                       # → daemon-reload → enable --now → 等 /health 通过
 ```
+
+> 就算不装 systemd 也能用：插件默认会在连接被拒时自己把服务拉起来（见下节）。
 
 装好之后：
 
@@ -83,6 +88,25 @@ systemctl --user disable --now sensevoice  # 临时关掉
 - 想开机即启（不等图形登录）可 `loginctl enable-linger "$USER"`，代价是常驻内存。
 - 换 GPU：`FUNASR_DEVICE=cuda ./scripts/install-service.sh`，然后 `systemctl --user restart sensevoice`。
 - 脚本会把**当前目录的绝对路径**写进 unit，所以别移动这个仓库；移动后重跑一次即可。
+
+### 或者：让插件自己把服务拉起来（默认开启）
+
+`autostart` 默认是 `true`，所以**你什么都不用配**：第一次转写遇到连接被拒时，插件会自己执行
+`autostartCommand`（默认就是本仓库的 `scripts/serve-sensevoice.sh`），轮询 `/health` 直到就绪，
+然后**自动重试这一次转写**。你只会看到一条「SenseVoice 服务未启动，正在启动…」。
+
+- 只对回环 `endpoint`（`127.0.0.1` / `localhost` / `::1`）生效，远端服务不会被启动。
+- 拉起的进程是 detached 的，**不随 TUI 退出而停止**（它是服务，不属于某个会话）；
+  想停掉：`pkill -f funasr-server`。
+- 输出写到 `~/.local/share/opencode/sensevoice-autostart.log`（TUI 占着终端，日志不能直接吐出来）。
+- 已经装了 systemd 服务的话不会重复启动：插件动手前先探测 `/health`，systemd 先到就等它。
+- 想只借用 systemd 的托管、不再起第二份：
+
+```json
+"autostartCommand": ["systemctl", "--user", "start", "sensevoice"]
+```
+
+- 关掉：`"autostart": false`（那就得自己保证服务在跑）。
 
 ## 二、启用插件
 
@@ -159,6 +183,9 @@ ln -s /home/arch-xnn/项目/opencodevoice ~/.config/opencode/plugins/sensevoice
 | `button` | `composer` | 语音按钮位置：`composer` 挂在输入框内右下角（默认）；也可用宿主暴露的槽位 `prompt.footer`、`prompt.footer.status`、`session.composer.top`；`false` 关闭按钮 |
 | `toggleKey` | `alt+r` | 转写并写入输入框的键 |
 | `submitKey` | `alt+shift+r` | 转写、写入并发送的键 |
+| `autostart` | `true` | 转写遇到连接被拒时，由插件自己把服务拉起来（仅对回环 endpoint 生效） |
+| `autostartCommand` | `["bash", "<插件目录>/scripts/serve-sensevoice.sh"]` | 拉起服务用的 argv，可换成 `["systemctl","--user","start","sensevoice"]` |
+| `autostartTimeout` | `120` | 启动后等待 `/health` 就绪的秒数（上限 600） |
 
 录音默认用 **ffmpeg**（PulseAudio 默认输入源 → 16 kHz 单声道 WAV）。
 如需换成其他命令，例如 ALSA `arecord` 或较轻量的 `parecord`：
@@ -172,9 +199,9 @@ ln -s /home/arch-xnn/项目/opencodevoice ~/.config/opencode/plugins/sensevoice
 
 ## 故障排查
 
-- 提示 `转写失败: ECONNREFUSED: Unable to connect`：服务没在跑。插件不会自动拉起服务，
-  先 `systemctl --user start sensevoice`（首次用 `./scripts/install-service.sh` 装好），
-  或临时 `./scripts/serve-sensevoice.sh`；然后 `curl http://127.0.0.1:8000/health` 确认。
+- 提示 `转写失败: ECONNREFUSED`：服务没在跑，插件会自动拉起（见上）；若自动启动也失败/超时，
+  看 `~/.local/share/opencode/sensevoice-autostart.log`。首次运行要装 torch + funasr（1–2 GB）
+  会超过 `autostartTimeout`，先手动跑一次 `./scripts/serve-sensevoice.sh`（或 `install-service.sh`）预热 `.venv`。
 - 提示 `转写失败: HTTP ...`：确认端口与 `endpoint` 一致。
 - 提示 `无法启动录音程序`：确认 `ffmpeg` 在 PATH 中，或改用 `arecord`。
 - 提示 `没找到输入栏`：热键触发时输入框没有获得焦点（比如焦点在列表/弹窗上），

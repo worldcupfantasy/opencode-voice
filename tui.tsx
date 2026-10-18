@@ -16,9 +16,11 @@ import { Plugin } from "@opencode/plugin/tui"
 import * as opentui from "@opentui/core"
 import { createSignal } from "solid-js"
 import { spawn, type ChildProcess } from "node:child_process"
+import { closeSync, openSync } from "node:fs"
 import { readFile, rm } from "node:fs/promises"
 import { join } from "node:path"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
+import { fileURLToPath } from "node:url"
 
 type Variant = "info" | "success" | "warning" | "error"
 type Status = "idle" | "recording" | "working"
@@ -48,6 +50,16 @@ interface Options {
   toggleKey: string
   /** Keybind that additionally submits the prompt after inserting. */
   submitKey: string
+  /**
+   * Start the local server ourselves when the first transcription is refused
+   * (ECONNREFUSED). Only applies to loopback endpoints. The started server is
+   * detached: it keeps running after the TUI exits.
+   */
+  autostart: boolean
+  /** argv used to start the server (a launcher script or systemctl, ...). */
+  autostartCommand: string[]
+  /** Seconds to wait for the server to answer /health after starting it. */
+  autostartTimeout: number
 }
 
 /** Minimal structural view of the focused editor we write into. */
@@ -75,6 +87,34 @@ const DEFAULT_RECORDER = [
   "-y",
 ]
 
+/** Directory holding this plugin file — the checkout root for a local install. */
+const PLUGIN_DIR = (() => {
+  try {
+    return fileURLToPath(new URL(".", import.meta.url))
+  } catch {
+    return process.cwd()
+  }
+})()
+
+/** Where an auto-started server writes its output: the TUI owns the terminal. */
+const AUTOSTART_LOG = join(homedir(), ".local", "share", "opencode", "sensevoice-autostart.log")
+
+/** Default launcher: the script shipped next to this plugin. */
+const DEFAULT_AUTOSTART = ["bash", join(PLUGIN_DIR, "scripts", "serve-sensevoice.sh")]
+
+/** Only a loopback endpoint can be something we start on this machine. */
+function isLocalEndpoint(endpoint: string): boolean {
+  try {
+    const host = new URL(endpoint).hostname
+    return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "0.0.0.0"
+  } catch {
+    return false
+  }
+}
+
+const describe = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error)
+
 function readOptions(raw: Readonly<Record<string, unknown>>): Options {
   const str = (key: string, fallback: string) =>
     typeof raw[key] === "string" ? (raw[key] as string) : fallback
@@ -97,6 +137,15 @@ function readOptions(raw: Readonly<Record<string, unknown>>): Options {
     button,
     toggleKey: str("toggleKey", "alt+r"),
     submitKey: str("submitKey", "alt+shift+r"),
+    autostart: raw.autostart !== false,
+    autostartCommand:
+      Array.isArray(raw.autostartCommand) && raw.autostartCommand.length > 0
+        ? raw.autostartCommand.map(String)
+        : DEFAULT_AUTOSTART,
+    autostartTimeout:
+      typeof raw.autostartTimeout === "number" && raw.autostartTimeout > 0
+        ? Math.min(raw.autostartTimeout, 600)
+        : 120,
   }
 }
 
@@ -119,6 +168,10 @@ export default Plugin.define({
     let pendingText: string | undefined
     let pendingSubmit = false
     let pendingTries = 0
+    /** Server we spawned because nothing was listening (autostart). */
+    let serverChild: ChildProcess | undefined
+    /** The spawned launcher died without ever answering /health. */
+    let serverDied = false
 
     /** A renderable the host already tore down must never be touched again. */
     const live = (node: unknown): boolean =>
@@ -194,6 +247,107 @@ export default Plugin.define({
         }, 5000)
       })
       return file
+    }
+
+    /** True when the failure means "nothing is listening" rather than "bad request". */
+    function isConnectionError(error: unknown): boolean {
+      const seen = new Set<unknown>()
+      let current: unknown = error
+      while (current && typeof current === "object" && !seen.has(current)) {
+        seen.add(current)
+        const { code, message } = current as { code?: unknown; message?: unknown }
+        if (typeof code === "string" && /^(ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH)$/.test(code)) {
+          return true
+        }
+        if (
+          typeof message === "string" &&
+          /ECONNREFUSED|Unable to connect|Connection refused|connection refused/i.test(message)
+        ) {
+          return true
+        }
+        current = (current as { cause?: unknown }).cause
+      }
+      return false
+    }
+
+    /** `/health`, falling back to `/v1/models` for servers that only speak OpenAI. */
+    async function serverHealthy(): Promise<boolean> {
+      let origin: string
+      try {
+        origin = new URL(options.endpoint).origin
+      } catch {
+        return false
+      }
+      for (const url of [`${origin}/health`, `${origin}/v1/models`]) {
+        try {
+          const res = await fetch(url, { signal: AbortSignal.timeout(2000) })
+          if (res.ok) return true
+        } catch {}
+      }
+      return false
+    }
+
+    /** Spawn the launcher, then wait for the port to answer. */
+    async function startServer(): Promise<boolean> {
+      // systemd (or another opencode instance) may have won the race already.
+      if (await serverHealthy()) return true
+
+      if (!serverChild && !serverDied) {
+        let fd: number | undefined
+        try {
+          fd = openSync(AUTOSTART_LOG, "a")
+          const [cmd, ...args] = options.autostartCommand
+          const proc = spawn(cmd, args, {
+            cwd: PLUGIN_DIR,
+            detached: true, // survive the TUI exiting: it is a server
+            stdio: ["ignore", fd, fd],
+          })
+          const onGone = () => {
+            if (serverChild === proc) serverChild = undefined
+            serverDied = true
+          }
+          proc.on("error", onGone)
+          proc.on("exit", onGone)
+          proc.unref()
+          serverChild = proc
+        } catch (error) {
+          serverDied = true
+          toast(`无法启动 SenseVoice 服务: ${describe(error)}`, "error")
+          return false
+        } finally {
+          if (fd !== undefined) {
+            try {
+              closeSync(fd)
+            } catch {}
+          }
+        }
+      }
+
+      const deadline = Date.now() + options.autostartTimeout * 1000
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+        if (await serverHealthy()) return true
+        if (serverDied) return false // launcher exited without listening
+      }
+      return false
+    }
+
+    /** Transcribe, bringing a local server up first if nothing is listening. */
+    async function transcribeWithServer(file: string): Promise<string> {
+      try {
+        return await transcribe(file)
+      } catch (error) {
+        const canAutostart = options.autostart && isLocalEndpoint(options.endpoint)
+        if (!canAutostart || !isConnectionError(error)) throw error
+        if (serverDied) {
+          throw new Error(`${describe(error)}；自动启动失败，日志: ${AUTOSTART_LOG}`)
+        }
+        toast("SenseVoice 服务未启动，正在启动…", "info")
+        if (!(await startServer())) {
+          throw new Error(`${describe(error)}；自动启动超时，日志: ${AUTOSTART_LOG}`)
+        }
+        return await transcribe(file)
+      }
     }
 
     async function transcribe(file: string): Promise<string> {
@@ -274,7 +428,7 @@ export default Plugin.define({
       }
       setStatus("working")
       try {
-        const text = await transcribe(file)
+        const text = await transcribeWithServer(file)
         if (!text) {
           toast("没有识别到语音内容", "warning")
           return
@@ -291,10 +445,12 @@ export default Plugin.define({
 
         if (autoSubmit) submitPrompt()
       } catch (error) {
-        toast(
-          `转写失败: ${error instanceof Error ? error.message : String(error)}（请确认 SenseVoice 服务已启动: ${options.endpoint}）`,
-          "error",
-        )
+        // With autostart on, transcribeWithServer() already explains itself.
+        const suffix =
+          isConnectionError(error) && !(options.autostart && isLocalEndpoint(options.endpoint))
+            ? `（请确认 SenseVoice 服务已启动: ${options.endpoint}）`
+            : ""
+        toast(`转写失败: ${describe(error)}${suffix}`, "error")
       } finally {
         setStatus("idle")
         void rm(file, { force: true }).catch(() => {})
