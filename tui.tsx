@@ -425,10 +425,12 @@ export default Plugin.define({
       const focused = focusedEditor()
       if (focused) found.push(focused)
       let visited = 0
+      // Caps are only a guard against a pathological tree; a real session walks
+      // a few hundred nodes, so they are set well above that.
       const walk = (node: any, depth: number): void => {
-        if (!node?.getChildren || depth > 24 || visited > 4000) return
+        if (!node?.getChildren || depth > 32 || visited > 20000) return
         for (const child of node.getChildren()) {
-          if (++visited > 4000) return
+          if (++visited > 20000) return
           if (!live(child)) continue
           if (typeof child.insertText === "function" && "plainText" in child) found.push(child)
           else walk(child, depth + 1)
@@ -571,10 +573,12 @@ export default Plugin.define({
       } catch {}
     }
 
-    // Both jobs on one timer: re-mount the button after the host rebuilds the
-    // composer, and flush a transcript that had nowhere to land. Everything
-    // inside is exception-guarded, so it can never spam the log.
-    function stop(): void {
+    // Tears the timer and the button down. It must not be called `stop`: the
+    // recorder's `stop()` above lives in the same scope, and a second function
+    // declaration silently shadows it (the last one wins), so `finish()`'s
+    // `await stop()` used to run this teardown instead of finalising the wav —
+    // the button detached and the recorder was left running.
+    function shutdown(): void {
       if (ticker) clearInterval(ticker)
       ticker = undefined
       try {
@@ -583,7 +587,7 @@ export default Plugin.define({
       removeButton = undefined
       detachButton()
     }
-    handoff.__sensevoiceVoiceStop = stop
+    handoff.__sensevoiceVoiceStop = shutdown
 
     tick()
     try {
@@ -591,8 +595,8 @@ export default Plugin.define({
     } catch {}
 
     return () => {
-      if (handoff.__sensevoiceVoiceStop === stop) handoff.__sensevoiceVoiceStop = undefined
-      stop()
+      if (handoff.__sensevoiceVoiceStop === shutdown) handoff.__sensevoiceVoiceStop = undefined
+      shutdown()
       if (child) {
         try {
           child.kill("SIGINT")
