@@ -1,10 +1,8 @@
 # opencode-sensevoice-voice
 
-OpenCode **V2** TUI 语音输入插件，后端使用**本地 SenseVoiceSmall**（通过 FunASR 的
-OpenAI 兼容 `/v1/audio/transcriptions` 服务），全程离线，音频不出本机。
+OpenCode **V2** TUI 语音离线输入插件，后端使用**本地 SenseVoiceSmall**（通过 FunASR 的
+OpenAI 兼容 `/v1/audio/transcriptions` 服务）
 
-> 为什么是自己写：OpenCode V2 没有内置语音输入，社区插件 `@renjfk/opencode-voice`
-> 是 V1 插件 API，在 V2 中无法直接运行（V1→V2 插件 API 是破坏性变更）。
 
 ## 工作方式
 
@@ -20,7 +18,7 @@ OpenAI 兼容 `/v1/audio/transcriptions` 服务），全程离线，音频不出
 V2 的 CLI 插件 API 本身没有“写入输入框”的接口，但渲染器有：
 `context.renderer.currentFocusedEditor` 就是当前获得焦点的编辑缓冲（即输入框），
 对它调用 `EditBufferRenderable.insertText(text)` 即可把转写结果直接打进输入框，
-光标停在其后，你接着编辑/回车发送即可。所以**不会弹对话框**。
+光标停在其后，编辑/回车发送即可。所以**不会弹对话框**。
 
 **按钮挂载位置**：V2 的槽位树里没有“输入框内那行模型信息”的槽位（只暴露了输入框下方
 的 `prompt.footer*`）。所以插件改走渲染器树：`currentFocusedEditor` 的父节点同时持有
